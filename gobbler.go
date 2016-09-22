@@ -1,4 +1,4 @@
-package main
+package gobbler
 
 import (
 	"crypto/md5"
@@ -6,21 +6,27 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const API_ROOT string = "https://ws.audioscrobbler.com/2.0/"
 
+type ApiClient interface {
+	PostForm(url string, data url.Values) (*http.Response, error)
+}
+
 type Gobbler struct {
-	ApiKey     string
-	Secret     string
 	LoggedIn   bool
 	SessionKey string
+	ApiKey     string
+	Secret     string
+	Client     ApiClient
 }
 
 type LoginRequest struct {
@@ -39,17 +45,43 @@ type LoginResponse struct {
 }
 
 type ScrobbleRequest struct {
-	Artist string
-	Track  string
-	Album  string
+	Artist    string
+	Track     string
+	Album     string
+	Timestamp string
+	Sk        string
+}
+
+type NameResponse struct {
+	Text      string `json:"#text"`
+	Corrected string `json:"corrected"`
 }
 
 type ScrobbleResponse struct {
-	Scrobbles []struct {
-		Blah string
+	Scrobbles struct {
+		Scrobble struct {
+			Track       NameResponse `json:"track"`
+			Artist      NameResponse `json:"artist"`
+			Album       NameResponse `json:"album"`
+			AlbumArtist NameResponse `json:"albumArtist"`
+			Timestamp   string       `json:"timestamp"`
+		} `json:"scrobble"`
 	} `json:"scrobbles"`
 }
 
+func New(apiKey, Secret string) *Gobbler {
+	client := &http.Client{}
+	return &Gobbler{
+		ApiKey: apiKey,
+		Secret: Secret,
+		Client: client,
+	}
+}
+
+// Use this method to authenticate against the Last.fm API
+// The returned session key will be stored in Gobbler's SessionKey
+// field. Depending on the result of the operation, the LoggedIn
+// field is either set to false or true
 func (g *Gobbler) Login(username, password string) (bool, error) {
 	c := &LoginRequest{username, password}
 	r := &LoginResponse{}
@@ -67,26 +99,58 @@ func (g *Gobbler) Login(username, password string) (bool, error) {
 	}
 }
 
-func (g *Gobbler) Scrobble(artist, track, album string) (bool, error) {
-	// TODO
-	return false, nil
+// Use this method to scrobble individual tracks. Artist
+// and track are required fields, album can be empty string.
+// For return value fields check ScrobbleResponse.
+func (g *Gobbler) Scrobble(artist, track, album string) (*ScrobbleResponse, error) {
+	if !g.LoggedIn {
+		return nil, errors.New("You need to be logged in")
+	}
+	if artist == "" || track == "" {
+		return nil, errors.New("Artist and track must be filled in")
+	}
+	c := &ScrobbleRequest{
+		Artist:    artist,
+		Track:     track,
+		Timestamp: strconv.FormatInt(time.Now().Unix(), 10),
+		Sk:        g.SessionKey,
+	}
+	if album != "" {
+		c.Album = album
+	}
+	r := &ScrobbleResponse{}
+	data, _ := g.post("track.scrobble", c)
+	err := json.Unmarshal(data, &r)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
-func (g *Gobbler) post(method string, data interface{}) ([]byte, error) {
-	params := map[string]string{}
-	params["method"] = method
-	params["api_key"] = g.ApiKey
-
+// This method will take a struct containing only string fields
+// and return a map of strings with the keys being lowercased
+// names of the fields.
+// If the struct contains other fields than strings, this returns
+// an error.
+func structToMap(data interface{}) (map[string]string, error) {
+	m := map[string]string{}
 	r := reflect.ValueOf(data).Elem()
 	t := r.Type()
 	for i := 0; i < r.NumField(); i++ {
-		params[strings.ToLower(t.Field(i).Name)] = r.Field(i).String()
+		if t := r.Field(i).Kind(); t != reflect.String {
+			return nil, errors.New(fmt.Sprintf("The type can only be string, not %s", t))
+		}
+		m[strings.ToLower(t.Field(i).Name)] = r.Field(i).String()
 	}
+	return m, nil
+}
 
-	sig, err := gobblerSignature(params, g.Secret)
-	if err != nil {
-		panic("Can't sign this")
-	}
+func (g *Gobbler) post(method string, data interface{}) ([]byte, error) {
+	params, _ := structToMap(data)
+	params["method"] = method
+	params["api_key"] = g.ApiKey
+
+	sig := gobblerSignature(params, g.Secret)
 	params["api_sig"] = sig
 	params["format"] = "json"
 
@@ -95,7 +159,7 @@ func (g *Gobbler) post(method string, data interface{}) ([]byte, error) {
 		pv.Add(k, v)
 	}
 
-	result, err := http.PostForm(API_ROOT, pv)
+	result, err := g.Client.PostForm(API_ROOT, pv)
 	if err != nil {
 		return nil, err
 	}
@@ -104,11 +168,10 @@ func (g *Gobbler) post(method string, data interface{}) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Println(strings.TrimSpace(string(body))) // TODO Remove me maybe?
 	return body, nil
 }
 
-func gobblerSignature(pv map[string]string, secret string) (string, error) {
+func gobblerSignature(pv map[string]string, secret string) string {
 	sk := make([]string, 0, len(pv))
 	sts := ""
 	// Sort the keys in alphabetic order
@@ -123,5 +186,5 @@ func gobblerSignature(pv map[string]string, secret string) (string, error) {
 	// Finally append the secret
 	sts += secret
 	// Return a MD5 hash of it
-	return fmt.Sprintf("%x", md5.Sum([]byte(sts))), nil
+	return fmt.Sprintf("%x", md5.Sum([]byte(sts)))
 }
